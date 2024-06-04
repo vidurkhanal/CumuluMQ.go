@@ -4,13 +4,38 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sync"
+	"time"
 )
 
-func main() {
-	// Connect to the server
-	conn, err := net.Dial("tcp", "0.0.0.0:8080")
+const (
+	maxRetries = 3
+	retryDelay = time.Second
+)
+
+func connectWithRetry(id int) (net.Conn, error) {
+	var conn net.Conn
+	var err error
+
+	// Retry logic for establishing connection
+	for i := 0; i < maxRetries; i++ {
+		conn, err = net.Dial("tcp", "0.0.0.0:8080")
+		if err == nil {
+			return conn, nil
+		}
+		fmt.Printf("Request %d: Failed to connect to server (attempt %d): %v\n", id, i+1, err)
+		time.Sleep(retryDelay)
+	}
+
+	return nil, fmt.Errorf("Request %d: Failed to connect to server after %d attempts: %v", id, maxRetries, err)
+}
+
+func sendRequest(wg *sync.WaitGroup, id int) {
+	defer wg.Done()
+
+	conn, err := connectWithRetry(id)
 	if err != nil {
-		fmt.Println("Failed to connect to server:", err)
+		fmt.Println(err)
 		return
 	}
 	defer conn.Close()
@@ -32,15 +57,50 @@ func main() {
 	binary.LittleEndian.PutUint32(message[9+topicLength:9+topicLength+4], uint32(messageBodyLength))
 	copy(message[9+topicLength+4:], messageBody)
 
-	// DEBUG
-	// fmt.Println("Message: %#v", message)
-
 	// Send the message to the server
 	_, err = conn.Write(message)
 	if err != nil {
-		fmt.Println("Failed to send message:", err)
+		fmt.Printf("Request %d: Failed to send message: %v\n", id, err)
 		return
 	}
 
-	fmt.Println("Message sent successfully")
+	fmt.Printf("Request %d: Message sent successfully\n", id)
+
+	// Read the response length
+	respLenBuf := make([]byte, 4)
+	_, err = conn.Read(respLenBuf)
+	if err != nil {
+		fmt.Printf("Request %d: Failed to read response length: %v\n", id, err)
+		return
+	}
+	respLength := binary.LittleEndian.Uint32(respLenBuf)
+
+	// Read the response data in chunks
+	response := make([]byte, respLength)
+	totalRead := 0
+	for totalRead < int(respLength) {
+		n, err := conn.Read(response[totalRead:])
+		if err != nil {
+			fmt.Printf("Request %d: Failed to read response: %v\n", id, err)
+			return
+		}
+		totalRead += n
+	}
+
+	// Print the response
+	fmt.Printf("Request %d: Response received: %s\n", id, string(response))
+}
+
+func main() {
+	var wg sync.WaitGroup
+	numRequests := 200
+
+	wg.Add(numRequests)
+	for i := 0; i < numRequests; i++ {
+		go sendRequest(&wg, i)
+	}
+
+	// Wait for all requests to complete
+	wg.Wait()
+	fmt.Println("All requests completed")
 }
